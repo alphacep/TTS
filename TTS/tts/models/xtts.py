@@ -582,6 +582,84 @@ class Xtts(BaseTTS):
             "speaker_embedding": speaker_embedding,
         }
 
+    @torch.inference_mode()
+    def inference_batch(
+        self,
+        texts,
+        size,
+        language,
+        gpt_cond_latents,
+        speaker_embeddings,
+        # GPT inference
+        temperature=0.75,
+        length_penalty=1.0,
+        repetition_penalty=10.0,
+        top_k=50,
+        top_p=0.85,
+        do_sample=True,
+        num_beams=1,
+        speed=1.0,
+        **hf_generate_kwargs,
+    ):
+        language = language.split("-")[0]  # remove the country code
+        length_scale = 1.0 / max(speed, 0.05)
+        gpt_cond_latents = torch.stack(gpt_cond_latents).to(self.device)
+        speaker_embeddings = torch.stack(speaker_embeddings).unsqueeze(-1).to(self.device)
+        text_tokens = [torch.IntTensor(self.tokenizer.encode(text.strip().lower(), lang=language)) for text in texts]
+        max_size = max(token.size(0) for token in text_tokens)
+        padded_text_tokens = torch.IntTensor(size, max_size).zero_()
+        text_lens = torch.IntTensor(size)
+        for i, token in enumerate(text_tokens):
+            text_lens[i] = token.size(0)
+            padded_text_tokens[i, : text_lens[i] ] = token
+        padded_text_tokens = padded_text_tokens.to(self.device)
+        text_lens = text_lens.to(self.device)
+
+        assert (
+            padded_text_tokens.shape[-1] < self.args.gpt_max_text_tokens
+        ), " ❗ XTTS can only generate text with a maximum of 400 tokens."
+
+        with torch.no_grad():
+            gpt_codes = self.gpt.generate(
+                cond_latents=gpt_cond_latents,
+                text_inputs=padded_text_tokens,
+                text_lens=text_lens,
+                input_tokens=None,
+                do_sample=do_sample,
+                top_p=top_p,
+                top_k=top_k,
+                temperature=temperature,
+                length_penalty=length_penalty,
+                num_return_sequences=self.gpt_batch_size,
+                num_beams=num_beams,
+                repetition_penalty=repetition_penalty,
+                output_attentions=False,
+                **hf_generate_kwargs,
+            )
+            expected_output_len = torch.argmax((gpt_codes == self.gpt.stop_audio_token).to(dtype=torch.int), dim=1) * self.gpt.code_stride_len
+
+            gpt_latents = self.gpt(
+                padded_text_tokens,
+                text_lens,
+                gpt_codes,
+                expected_output_len,
+                cond_latents=gpt_cond_latents,
+                return_attentions=False,
+                return_latent=True,
+            )
+
+            if length_scale != 1.0:
+                gpt_latents = F.interpolate(
+                    gpt_latents.transpose(1, 2), scale_factor=length_scale, mode="linear"
+                ).transpose(1, 2)
+
+            wavs = self.hifigan_decoder(gpt_latents, g=speaker_embeddings).cpu()
+
+            out_wavs = []
+            for i in range(size):
+                out_wavs.append(wavs[i, :, :expected_output_len[i].item() + 20 * self.gpt.code_stride_len]) # Extra to fit the last silence
+        return out_wavs
+
     def handle_chunks(self, wav_gen, wav_gen_prev, wav_overlap, overlap_len):
         """Handle chunk formatting in streaming mode"""
         wav_chunk = wav_gen[:-overlap_len]

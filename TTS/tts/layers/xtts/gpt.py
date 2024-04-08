@@ -562,9 +562,11 @@ class GPT(nn.Module):
         self,
         cond_latents,
         text_inputs,
+        text_lens
     ):
         text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
         text_inputs = F.pad(text_inputs, (1, 0), value=self.start_text_token)
+
         emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
         emb = torch.cat([cond_latents, emb], dim=1)
         self.gpt_inference.store_prefix_emb(emb)
@@ -578,21 +580,37 @@ class GPT(nn.Module):
             device=text_inputs.device,
         )
         gpt_inputs[:, -1] = self.start_audio_token
-        return gpt_inputs
+
+        attn_mask = torch.full(
+            (
+                gpt_inputs.shape[0],
+                gpt_inputs.shape[1],
+            ),
+            fill_value=1,
+            dtype=torch.long,
+            device=text_inputs.device,
+        )
+        if text_lens is not None:
+            for i in range(len(text_lens)):
+                attn_mask[i, cond_latents.shape[1] + text_lens[i] + 1 :] = 0
+
+        return gpt_inputs, attn_mask
 
     def generate(
         self,
         cond_latents,
         text_inputs,
+        text_lens=None,
         **hf_generate_kwargs,
     ):
-        gpt_inputs = self.compute_embeddings(cond_latents, text_inputs)
+        gpt_inputs, attn_mask = self.compute_embeddings(cond_latents, text_inputs, text_lens)
         gen = self.gpt_inference.generate(
             gpt_inputs,
             bos_token_id=self.start_audio_token,
             pad_token_id=self.stop_audio_token,
             eos_token_id=self.stop_audio_token,
             max_length=self.max_gen_mel_tokens + gpt_inputs.shape[-1],
+            attention_mask = attn_mask,
             **hf_generate_kwargs,
         )
         if "return_dict_in_generate" in hf_generate_kwargs:
